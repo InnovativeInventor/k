@@ -6,9 +6,12 @@ from abc import ABC, abstractmethod
 from collections.abc import Container
 from dataclasses import dataclass, field
 from functools import reduce
+from itertools import chain
 from threading import RLock
 from typing import TYPE_CHECKING, Final, List, Union, cast, final
 
+from ..prelude.ml import mlAnd, mlOr
+from .semantics import KCFGSemantics
 from ..cterm import CSubst, CTerm, cterm_build_claim, cterm_build_rule
 from ..kast import EMPTY_ATT
 from ..kast.inner import KApply
@@ -23,7 +26,7 @@ from ..kast.manip import (
 )
 from ..kast.outer import KFlatModule
 from ..prelude.kbool import andBool
-from ..utils import ensure_dir_path, not_none, single
+from ..utils import ensure_dir_path, not_none, single, unique
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, MutableMapping
@@ -1150,6 +1153,146 @@ class KCFG(Container[Union['KCFG.Node', 'KCFG.Successor']]):
             return _lift_split(finder_lifter[0], finder_lifter[1]) or result
 
         return reduce(_fold_lift, [(self.edges, self.lift_split_edge), (self.splits, self.lift_split_split)], False)
+
+    def merge_nodes(self, semantics: KCFGSemantics) -> None:
+        """Merge targets of Split for cutting down the number of branches, using heuristics KCFGSemantics.is_mergeable.
+
+        This should be used after minimize().
+
+        Side Effect: The KCFG is rewritten by the following rewrite pattern,
+            - Match: A -|Split|-> A_1, A_2, ..., A_n && A_i -|Edge|-> B_i
+            - Rewrite:
+                - if `B_a, B_b, ..., B_c are not mergeable` then unchanged
+                    - A -|Split|-> A_a, A_b, ..., A_c
+                    - A_a, A_b, ..., A_c -|Edge|-> B_a, B_b, ..., B_c
+                - if `B_x, B_y, ..., B_z are mergeable`, then
+                    - A -|Split|-> A_x or A_y or ... or A_z
+                    - A_x or A_y or ... or A_z -|Edge|-> B_x or B_y or ... or B_z
+                    - B_x or B_y or ... or B_z -|Split|-> B_x, B_y, ..., B_z
+
+        Specifically, when `B_merge = B_x or B_y or ... or B_z`
+        - `or`: fresh variables in places where the configurations differ
+        - `Edge` in A -|Edge|-> B_merge:
+            - list of (depth, rules, constraints)
+            - depth and rules from A_i -|Edge|-> B_i
+            - constraints are from A -|Split|-> A_1, A_2, ..., A_n
+        - `Split` in B_merge -|Split|-> B_x, B_y, ..., B_z:
+            - subst for it is from A -|Split|-> A_1, A_2, ..., A_n
+        :param semantics: provides the is_mergeable heuristic
+        :return: None
+        """
+
+        # since this function is run after minimize(),
+        # - no edge-edge & edge-split & split-split in self before match
+        # - no edge-edge & split-split after rewrite
+        # - new edge-split after rewrite with the split targets covering by the postcondition.
+
+        def _merge_nodes(s: KCFGSemantics) -> bool:
+            _is_merged = False
+            # match: A -|Split|-> A_1, A_2, ..., A_n && A_i -|Edge|-> B_i
+            to_merge_splits: list[KCFG.Split] = []  # A -|Split|-> A_1, A_2, ..., A_n
+            to_merge_edges_list: list[list[KCFG.Edge]] = []  # A_i -|Edge|-> B_i
+            for split in self.splits():
+                edges = [single(self.edges(source_id=a_i)) for a_i in split.target_ids if self.edges(source_id=a_i)]
+                if len(edges) > 2:
+                    to_merge_splits.append(split)
+                    to_merge_edges_list.append(edges)
+            # rewrite: if s.is_mergeable(B_i) then A -|Edge|-> merged(B_i) -|Split|-> B_i else unchanged
+            while to_merge_splits:
+                to_merge_split = to_merge_splits.pop()
+                to_merge_edges = to_merge_edges_list.pop()
+                # find all mergeable groups for each split
+                mergable_edges_group: list[list[KCFG.Edge]] = []
+                while to_merge_edges:
+                    mergable_edges: list[KCFG.Edge] = [to_merge_edges.pop()]
+                    idx = 0
+                    while idx < len(to_merge_edges):
+                        for mergable_edge in mergable_edges:
+                            if s.is_mergeable(mergable_edge.target.cterm, to_merge_edges[idx].target.cterm):
+                                mergable_edges.append(to_merge_edges.pop(idx))
+                                break
+                        idx += 1
+                    if len(mergable_edges) > 1:
+                        mergable_edges_group.append(mergable_edges)
+                if len(mergable_edges_group) == 0:
+                    continue
+                _is_merged = True
+                # for each group, create the merged edge and corresponding splits
+                # Given Ai -|Edge|-> Bi; Return merged(Ai) -|Edge|-> merged(Bi) -|Split|-> Bi
+                original_splits = to_merge_split.splits
+                new_splits: dict[int, CSubst] = {}
+                merged_edges: list[KCFG.Edge] = []
+                for mergable_edges in mergable_edges_group:
+                    mergable_cterm_pairs = [(edge.source.cterm, edge.target.cterm) for edge in mergable_edges]
+
+                    # obtain merged A and new split csubst for merged A
+                    _union_csubst = lambda x, y: CSubst(x.subst.union(y.subst), [mlOr([x.constraint, y.constraint])])
+                    origin_a_i = [edge.source.id for edge in mergable_edges]
+                    merged_a_cterm, _, _ = mergable_cterm_pairs[0][0].anti_unify(mergable_cterm_pairs[1][0])
+                    new_split = _union_csubst(original_splits.pop(origin_a_i[0]), original_splits.pop(origin_a_i[1]))
+
+                    merged_b_cterm, csubst0, csubst1 = mergable_cterm_pairs[0][1].anti_unify(mergable_cterm_pairs[1][1])
+
+                    def _add_constraints(cs: CSubst, ct: CTerm) -> CSubst:
+                        for constraint in ct.constraints:
+                            cs = cs.add_constraint(constraint)
+                        return cs
+
+                    def _merge_csubst(mergable_csbts: Iterable[CSubst], csbt: CSubst) -> tuple[CSubst, ...]:
+                        new_csubsts = []
+                        for temp_csbt in mergable_csbts:
+                            new_csubsts.append(
+                                CSubst(temp_csbt.subst.union(csbt.subst),
+                                       unique(chain(temp_csbt.constraints, csbt.constraints)))
+                            )
+                        return tuple(new_csubsts)
+
+                    csubst0 = _add_constraints(csubst0, mergable_cterm_pairs[0][1])
+                    csubst1 = _add_constraints(csubst1, mergable_cterm_pairs[1][1])
+                    csubsts = [csubst0, csubst1]
+                    depths = [depth for edge in mergable_edges for depth in edge.depths]
+                    rules_list = [rules for edge in mergable_edges for rules in edge.rules_list]
+                    edge_csubsts = []
+                    edge_csubsts.extend(_merge_csubst(mergable_edges[0].csubsts, csubsts[0]))
+                    edge_csubsts.extend(_merge_csubst(mergable_edges[1].csubsts, csubsts[1]))
+                    idx = 2
+                    for a_cterm, b_cterm in mergable_cterm_pairs[2:]:
+                        merged_a_cterm, _, _ = a_cterm.anti_unify(merged_a_cterm)
+                        new_split = _union_csubst(new_split, original_splits.pop(origin_a_i[idx]))
+                        merged_b_cterm, csubst, _ = b_cterm.anti_unify(merged_b_cterm)
+                        edge_csubsts.extend(_merge_csubst(mergable_edges[idx].csubsts, csubst))
+                        csubst = _add_constraints(csubst, b_cterm)
+                        csubsts.append(csubst)
+                        idx += 1
+                    merged_a_node = self.create_node(merged_a_cterm)
+                    merged_b_node = self.create_node(merged_b_cterm)
+                    merged_edge = self.create_edge(merged_a_node.id, merged_b_node.id, depths, rules_list, edge_csubsts)
+                    merged_edges.append(merged_edge)
+                    new_splits[merged_a_node.id] = new_split
+
+                    origin_b_i = [edge.target.id for edge in mergable_edges]
+                    splits = zip(origin_b_i, csubsts, strict=True)
+                    self.create_split(merged_b_node.id, splits)
+
+                # delete the merged A_i
+                for mergable_edges in mergable_edges_group:
+                    for edge in mergable_edges:
+                        self.remove_node(edge.source.id)
+
+                # create the new split A -|Split|-> merged A
+                if len(original_splits) == 0 and len(new_splits) == 1:
+                    merged_edge = single(merged_edges)
+                    self.create_edge(to_merge_split.source.id, merged_edge.target.id, merged_edge.depths,
+                                                merged_edge.rules_list, merged_edge.csubsts)
+                    self.remove_node(merged_edge.source.id)
+                else:
+                    new_splits = original_splits | new_splits
+                    self.create_split(to_merge_split.source.id, new_splits.items())
+            return _is_merged
+
+        is_merged = True
+        while is_merged:
+            is_merged = _merge_nodes(semantics)
 
     def minimize(self) -> None:
         """Minimize KCFG by repeatedly performing the lifting transformations.

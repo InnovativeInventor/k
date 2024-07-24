@@ -22,7 +22,10 @@ class KCFGSemantics(ABC):
     def custom_step(self, c: CTerm) -> KCFGExtendResult | None: ...
 
     @abstractmethod
-    def is_mergeable(self, c1: CTerm, c2: CTerm) -> bool: ...
+    def is_mergeable(self, c1: CTerm, c2: CTerm) -> bool:
+        """Mergability should be an equivalence relation.
+        So it should partition the nodes. Transitive, commutative, and reflexive."""
+        ...
 
 
 class DefaultSemantics(KCFGSemantics):
