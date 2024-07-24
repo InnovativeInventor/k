@@ -40,7 +40,6 @@ class TestSemantics(DefaultSemantics):
 
 
 def merge_node_test_kcfg() -> KCFG:
-    # todo: this is not supported yet. we just assume that the mergeable edges with simple constraints are merged
     """
     1 -|Split: X >=Int 5|->            2 -|Edge: (5, (r1), #Top)|->                                                        6
       -|Split: X >=Int 3 & X <Int 5|-> 3 -|Edge: (10, (r2,r3), X >=Int 4 & X <Int 5), (15, (r4), X <Int 4 & X >=Int 3 )|-> 7
@@ -55,7 +54,7 @@ def merge_node_test_kcfg() -> KCFG:
             (2, 6, [5], [['r1']], [CSubst()]),
             (3, 7, [10, 15], [['r2', 'r3'], ['r4']], [x_subst().add_constraint(x_ge_4).add_constraint(x_lt_5), x_subst().add_constraint(x_ge_3).add_constraint(x_lt_4)]),
             (4, 8, [20], [['r5']], [CSubst()]),
-            (5, 9, [25], ['r6'], [CSubst()]),
+            (5, 9, [25], [['r6']], [CSubst()]),
         ),
         'splits': split_dicts((1, [(2, x_ge_5), (3, mlAnd([x_ge_3, x_lt_5])), (4, mlAnd([x_ge_0, x_lt_3])), (5, x_lt_0)]), csubst=x_subst()),
     }
@@ -67,7 +66,8 @@ def merge_node_test_kcfg() -> KCFG:
 def merge_node_test_kcfg_simple_expected() -> KCFG:
     """
     1 -|Edge: (5, (r1), X >=Int 5),
-              (10, (r2,r3), X >=Int 4 & X <Int 5), (15, (r4), X <Int 4 & X >=Int 3 ),
+              (10, (r2,r3), X >=Int 4 & X <Int 5),
+              (15, (r4), X <Int 4 & X >=Int 3 ),
               (20, (r5), X >=Int 0 & X <Int 3),
               (25, (r6), X <Int 0)|
       -> 6 | 7 | 8 | 9
@@ -77,17 +77,17 @@ def merge_node_test_kcfg_simple_expected() -> KCFG:
       -|Split: X  <Int 0|->            9
     """
     d = {
-        'next': 11,
-        'nodes': node_dicts(10, config=x_config()),
+        'next': 12,
+        'nodes': node_dicts(11, config=x_config()),
         'edges': edge_dicts(
-            (1, 10, [5, 10, 15, 20, 25], [['r1'], ['r2', 'r3'], ['r4'], ['r5'], ['r6']],
+            (1, 11, [5, 10, 15, 20, 25], [['r1'], ['r2', 'r3'], ['r4'], ['r5'], ['r6']],
              [x_subst().add_constraint(x_ge_5),
               x_subst().add_constraint(x_ge_4).add_constraint(x_lt_5).add_constraint(x_ge_3),
               x_subst().add_constraint(x_ge_3).add_constraint(x_lt_4).add_constraint(x_lt_5),
-              x_subst().add_constraint(x_ge_0).add_constraint(x_lt_3),
+              x_subst().add_constraint(x_lt_3).add_constraint(x_ge_0),
               x_subst().add_constraint(x_lt_0)])
         ),
-        'splits': split_dicts((10, [(6, x_ge_5), (7, mlAnd([x_ge_3, x_lt_5])), (8, mlAnd([x_ge_0, x_lt_3])), (9, x_lt_0)]), csubst=x_subst()),
+        'splits': split_dicts((11, [(6, x_ge_5), (7, mlAnd([x_ge_3, x_lt_5])), (8, mlAnd([x_ge_0, x_lt_3])), (9, x_lt_0)]), csubst=x_subst()),
     }
     cfg = KCFG.from_dict(d)
     propagate_split_constraints(cfg)
@@ -95,6 +95,7 @@ def merge_node_test_kcfg_simple_expected() -> KCFG:
     cfg.remove_node(3)
     cfg.remove_node(4)
     cfg.remove_node(5)
+    cfg.remove_node(10)
     return cfg
 
 
